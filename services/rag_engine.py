@@ -1,14 +1,19 @@
 """
 services/rag_engine.py
 ----------------------
-Luồng RAG chính: nhận câu hỏi → tìm kiếm ngữ cảnh trong Qdrant
-→ xây dựng prompt → gọi Gemini LLM → trích xuất trích dẫn → trả kết quả.
+Luồng RAG chính với Query Router:
+  1. Router: phân loại câu hỏi → CHIT_CHAT hoặc RAG_REQUIRED.
+  2. Nếu CHIT_CHAT → LLM trả lời giao tiếp bình thường (không RAG).
+  3. Nếu RAG_REQUIRED → Semantic Search (Global) → Prompt → LLM → Citations.
 
-Bao gồm các guardrail:
-- Similarity threshold: nếu không tìm thấy chunk liên quan → trả no_answer.
-- Strict prompting: ép LLM chỉ dùng context, bắt buộc trích dẫn nguồn.
+Phiên bản v2:
+- Thêm bước Query Router (Structured Output, temperature=0).
+- Bỏ filter subject_id → Global Search toàn bộ Vector DB.
+- Chuyển sang Single-turn (bỏ history trong prompt).
+- Citation bao gồm chapter và section từ heading metadata.
 """
 
+import json
 import logging
 import re
 from typing import Any
@@ -17,10 +22,10 @@ from qdrant_client import models
 
 from core.config import get_settings
 from core.database import get_qdrant_client
-from core.llm_setup import get_embedding_model, get_llm
+from core.llm_setup import get_embedding_model, get_llm, get_router_llm
 from models.schemas import (
     Citation,
-    MessageHistory,
+    QueryIntent,
     QueryRequest,
     QueryResponse,
 )
@@ -28,20 +33,134 @@ from models.schemas import (
 logger = logging.getLogger(__name__)
 
 
-async def process_query(request: QueryRequest) -> QueryResponse:
-    """
-    Xử lý truy vấn RAG đầy đủ theo các bước:
+# ══════════════════════════════════════════════════════════════════
+# BƯỚC 1: QUERY ROUTER — Phân loại ý định câu hỏi
+# ══════════════════════════════════════════════════════════════════
 
-    1. Embedding câu hỏi thành vector.
-    2. Tìm Top-K chunks tương tự trong Qdrant (filter theo subject_id).
-    3. Kiểm tra similarity threshold → nếu quá thấp trả no_answer.
-    4. Xây dựng prompt kết hợp history + chunks + question.
-    5. Gọi Gemini LLM sinh câu trả lời.
-    6. Trích xuất citations từ metadata chunks.
-    7. Trả về QueryResponse hoàn chỉnh.
+async def _classify_intent(question: str) -> QueryIntent:
+    """
+    Sử dụng LLM (temperature=0) để phân loại ý định câu hỏi.
+    LLM được ép trả về Structured Output theo schema QueryIntent.
+
+    Strict prompt đảm bảo LLM KHÔNG trả lời câu hỏi,
+    chỉ phân loại là CHIT_CHAT hoặc RAG_REQUIRED.
 
     Args:
-        request: QueryRequest chứa câu hỏi, subject_id, lịch sử hội thoại.
+        question: Câu hỏi của người dùng.
+
+    Returns:
+        QueryIntent: Kết quả phân loại intent.
+    """
+    router_llm = get_router_llm()
+
+    # Prompt ép buộc LLM chỉ phân loại, KHÔNG trả lời
+    router_prompt = (
+        "Bạn là một bộ phân loại câu hỏi. Nhiệm vụ DUY NHẤT của bạn là xác định "
+        "ý định của câu hỏi dưới đây.\n\n"
+        "QUY TẮC:\n"
+        "- Chỉ phân loại câu hỏi là CHIT_CHAT hay RAG_REQUIRED.\n"
+        "- TUYỆT ĐỐI KHÔNG trả lời câu hỏi.\n"
+        "- TUYỆT ĐỐI KHÔNG giải thích lý do.\n"
+        "- Chỉ trả về JSON object duy nhất.\n\n"
+        "ĐỊNH NGHĨA:\n"
+        "- CHIT_CHAT: Câu chào hỏi, cảm ơn, tạm biệt, hỏi thăm sức khoẻ, "
+        "nói chuyện phiếm, câu không cần tra cứu tài liệu.\n"
+        "- RAG_REQUIRED: Câu hỏi về kiến thức, bài học, khái niệm, "
+        "yêu cầu giải thích nội dung học thuật, cần tra cứu tài liệu.\n\n"
+        "RESPONSE FORMAT (JSON):\n"
+        '{"intent": "CHIT_CHAT"} hoặc {"intent": "RAG_REQUIRED"}\n\n'
+        f'Câu hỏi: "{question}"\n\n'
+        "Trả về JSON:"
+    )
+
+    try:
+        response = await router_llm.acomplete(router_prompt)
+        response_text = response.text.strip()
+
+        # Parse JSON response từ LLM
+        # Xử lý trường hợp LLM bọc trong ```json ... ```
+        if "```" in response_text:
+            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(1)
+
+        parsed = json.loads(response_text)
+        intent = QueryIntent(**parsed)
+
+        logger.info("Query Router phân loại: %s", intent.intent)
+        return intent
+
+    except (json.JSONDecodeError, Exception) as e:
+        # Fallback: nếu parse lỗi, mặc định là RAG_REQUIRED (an toàn hơn)
+        logger.warning(
+            "Không parse được intent từ LLM response: '%s'. "
+            "Fallback → RAG_REQUIRED. Lỗi: %s",
+            response_text if 'response_text' in dir() else "N/A",
+            str(e),
+        )
+        return QueryIntent(intent="RAG_REQUIRED")
+
+
+# ══════════════════════════════════════════════════════════════════
+# BƯỚC 1B: XỬ LÝ CHIT_CHAT — Trả lời giao tiếp bình thường
+# ══════════════════════════════════════════════════════════════════
+
+async def _handle_chit_chat(question: str) -> QueryResponse:
+    """
+    Xử lý câu hỏi giao tiếp bình thường (CHIT_CHAT).
+    LLM trả lời tự nhiên, thân thiện, KHÔNG cần tra cứu tài liệu.
+
+    Args:
+        question: Câu hỏi giao tiếp của người dùng.
+
+    Returns:
+        QueryResponse với câu trả lời giao tiếp (không có citations).
+    """
+    llm = get_llm()
+
+    chit_chat_prompt = (
+        "Bạn là trợ lý giáo dục thân thiện tên là EduBot. "
+        "Hãy trả lời câu hỏi giao tiếp sau một cách tự nhiên, "
+        "vui vẻ và ngắn gọn bằng tiếng Việt.\n\n"
+        f"Câu hỏi: {question}"
+    )
+
+    try:
+        response = await llm.acomplete(chit_chat_prompt)
+        answer = response.text.strip()
+    except Exception as e:
+        logger.error("Lỗi khi xử lý CHIT_CHAT: %s", str(e))
+        raise
+
+    logger.info("CHIT_CHAT → Trả lời giao tiếp (%d ký tự)", len(answer))
+
+    return QueryResponse(
+        answer=answer,
+        citations=[],
+        confidence="high",
+        no_answer=False,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# HÀM CHÍNH: PROCESS QUERY
+# ══════════════════════════════════════════════════════════════════
+
+async def process_query(request: QueryRequest) -> QueryResponse:
+    """
+    Xử lý truy vấn với Query Router:
+
+    Bước 1: Router — Phân loại intent (CHIT_CHAT / RAG_REQUIRED).
+    Bước 2: Nếu CHIT_CHAT → trả lời giao tiếp, kết thúc.
+    Bước 3: Nếu RAG_REQUIRED → Embedding câu hỏi.
+    Bước 4: Global Search trong Qdrant (không filter subject_id).
+    Bước 5: Guardrail — kiểm tra similarity threshold.
+    Bước 6: Xây dựng prompt + gọi Gemini LLM.
+    Bước 7: Trích xuất citations (bao gồm chapter/section).
+    Bước 8: Trả về QueryResponse.
+
+    Args:
+        request: QueryRequest chứa câu hỏi và conversation_id.
 
     Returns:
         QueryResponse với câu trả lời, trích dẫn, và đánh giá confidence.
@@ -49,13 +168,23 @@ async def process_query(request: QueryRequest) -> QueryResponse:
     settings = get_settings()
 
     logger.info(
-        "Bắt đầu xử lý query: subject_id=%s, conversation_id=%s, question='%s'",
-        request.subject_id,
+        "Bắt đầu xử lý query: conversation_id=%s, question='%s'",
         request.conversation_id,
-        request.question[:100],  # Log 100 ký tự đầu để tránh quá dài
+        request.question[:100],
     )
 
-    # ── Bước 1: Embedding câu hỏi ─────────────────────────────────
+    # ── Bước 1: Query Router — Phân loại ý định ───────────────────
+    intent = await _classify_intent(request.question)
+
+    # ── Bước 2: Rẽ nhánh theo intent ──────────────────────────────
+    if intent.intent == "CHIT_CHAT":
+        logger.info("Intent = CHIT_CHAT → Chuyển sang xử lý giao tiếp")
+        return await _handle_chit_chat(request.question)
+
+    # ── Từ đây trở xuống: RAG_REQUIRED ────────────────────────────
+    logger.info("Intent = RAG_REQUIRED → Bắt đầu luồng RAG")
+
+    # ── Bước 3: Embedding câu hỏi ─────────────────────────────────
     embed_model = get_embedding_model()
 
     try:
@@ -64,22 +193,14 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         logger.error("Lỗi khi tạo embedding cho câu hỏi: %s", str(e))
         raise
 
-    # ── Bước 2: Tìm kiếm Top-K chunks trong Qdrant ────────────────
-    # BẮT BUỘC filter theo subject_id để chỉ tìm trong phạm vi môn học
+    # ── Bước 4: Global Search trong Qdrant ─────────────────────────
+    # KHÔNG filter theo subject_id → tìm toàn bộ Vector DB
     client = await get_qdrant_client()
 
     try:
         search_results = client.query_points(
             collection_name=settings.QDRANT_COLLECTION_NAME,
             query=question_vector,
-            query_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="subject_id",
-                        match=models.MatchValue(value=request.subject_id),
-                    )
-                ]
-            ),
             limit=settings.TOP_K,
             with_payload=True,
         )
@@ -90,8 +211,7 @@ async def process_query(request: QueryRequest) -> QueryResponse:
     results = search_results.points
     logger.info("Tìm thấy %d kết quả từ Qdrant", len(results))
 
-    # ── Bước 3: Guardrail — kiểm tra similarity threshold ─────────
-    # Lọc bỏ các kết quả có điểm tương đồng quá thấp
+    # ── Bước 5: Guardrail — kiểm tra similarity threshold ─────────
     filtered_results = [
         r for r in results
         if r.score >= settings.SIMILARITY_THRESHOLD
@@ -106,7 +226,7 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         )
         return QueryResponse(
             answer="Không đủ dữ liệu/Không tìm thấy thông tin liên quan "
-                   "trong tài liệu của môn học này.",
+                   "trong tài liệu hiện có.",
             citations=[],
             confidence="low",
             no_answer=True,
@@ -119,15 +239,13 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         filtered_results[0].score,
     )
 
-    # ── Bước 4: Xây dựng prompt cho LLM ───────────────────────────
+    # ── Bước 6: Xây dựng prompt + gọi LLM ─────────────────────────
     context_text = _build_context(filtered_results)
-    prompt = _build_prompt(
+    prompt = _build_rag_prompt(
         question=request.question,
         context=context_text,
-        history=request.history,
     )
 
-    # ── Bước 5: Gọi Gemini LLM sinh câu trả lời ──────────────────
     llm = get_llm()
 
     try:
@@ -139,10 +257,10 @@ async def process_query(request: QueryRequest) -> QueryResponse:
 
     logger.info("LLM đã sinh câu trả lời (%d ký tự)", len(answer_text))
 
-    # ── Bước 6: Trích xuất citations từ câu trả lời ───────────────
+    # ── Bước 7: Trích xuất citations ──────────────────────────────
     citations = _extract_citations(answer_text, filtered_results)
 
-    # ── Bước 7: Đánh giá confidence ───────────────────────────────
+    # ── Bước 8: Đánh giá confidence + trả về ─────────────────────
     confidence = _evaluate_confidence(filtered_results)
 
     return QueryResponse(
@@ -153,10 +271,15 @@ async def process_query(request: QueryRequest) -> QueryResponse:
     )
 
 
+# ══════════════════════════════════════════════════════════════════
+# HÀM PHỤ TRỢ (PRIVATE HELPERS)
+# ══════════════════════════════════════════════════════════════════
+
 def _build_context(results: list[Any]) -> str:
     """
     Xây dựng đoạn context từ danh sách kết quả Qdrant.
     Đánh số mỗi chunk [1], [2], ... để LLM có thể trích dẫn.
+    Bao gồm chapter/section nếu có trong metadata.
 
     Args:
         results: Danh sách ScoredPoint từ Qdrant.
@@ -171,40 +294,38 @@ def _build_context(results: list[Any]) -> str:
         text = payload.get("text", "")
         doc_id = payload.get("doc_id", "N/A")
         page = payload.get("page_number", 0)
+        chapter = payload.get("chapter", "")
+        section = payload.get("section", "")
 
-        context_parts.append(
-            f"[{idx}] (Tài liệu: {doc_id}, Trang: {page})\n{text}"
-        )
+        # Xây dựng dòng metadata với heading hierarchy
+        meta_parts = [f"Tài liệu: {doc_id}", f"Trang: {page}"]
+        if chapter:
+            meta_parts.append(f"Chương: {chapter}")
+        if section:
+            meta_parts.append(f"Mục: {section}")
+
+        meta_line = ", ".join(meta_parts)
+        context_parts.append(f"[{idx}] ({meta_line})\n{text}")
 
     return "\n\n---\n\n".join(context_parts)
 
 
-def _build_prompt(
-    question: str,
-    context: str,
-    history: list[MessageHistory],
-) -> str:
+def _build_rag_prompt(question: str, context: str) -> str:
     """
-    Xây dựng prompt hoàn chỉnh cho LLM, bao gồm:
-    - System instruction (strict rules)
-    - Lịch sử hội thoại (nếu có)
-    - Context từ Qdrant
-    - Câu hỏi hiện tại
+    Xây dựng prompt RAG (Single-turn, không có history).
 
-    RÀNG BUỘC QUAN TRỌNG:
+    RÀNG BUỘC:
     - LLM chỉ được dùng context đã cung cấp.
     - Bắt buộc trích dẫn nguồn [1], [2], ... sau mỗi ý.
     - Không được tự bịa thông tin.
 
     Args:
         question: Câu hỏi của người dùng.
-        context: Đoạn context đã format từ Qdrant chunks.
-        history: Lịch sử hội thoại trước đó.
+        context: Đoạn context từ Qdrant chunks.
 
     Returns:
         str: Prompt đầy đủ gửi tới LLM.
     """
-    # ── System instruction — ép buộc LLM tuân thủ ──────────────
     system_instruction = (
         "Bạn là trợ lý giáo dục thông minh. Hãy tuân thủ NGHIÊM NGẶT các quy tắc sau:\n\n"
         "1. CHỈ sử dụng thông tin từ phần CONTEXT bên dưới để trả lời câu hỏi.\n"
@@ -216,23 +337,8 @@ def _build_prompt(
         "5. Trả lời bằng tiếng Việt, rõ ràng, có cấu trúc.\n"
     )
 
-    # ── Lịch sử hội thoại (nếu có) ─────────────────────────────
-    history_text = ""
-    if history:
-        history_lines = []
-        for msg in history[-6:]:  # Giới hạn 6 tin nhắn gần nhất
-            role_label = "Người dùng" if msg.role == "user" else "Trợ lý"
-            history_lines.append(f"{role_label}: {msg.content}")
-        history_text = (
-            "\n--- LỊCH SỬ HỘI THOẠI ---\n"
-            + "\n".join(history_lines)
-            + "\n--- HẾT LỊCH SỬ ---\n"
-        )
-
-    # ── Ghép prompt hoàn chỉnh ──────────────────────────────────
     full_prompt = (
         f"{system_instruction}\n"
-        f"{history_text}\n"
         f"--- CONTEXT ---\n"
         f"{context}\n"
         f"--- HẾT CONTEXT ---\n\n"
@@ -250,8 +356,8 @@ def _extract_citations(
 ) -> list[Citation]:
     """
     Trích xuất danh sách Citation từ câu trả lời của LLM.
-    Tìm các pattern [1], [2], ... trong answer và khớp với metadata
-    của chunks tương ứng.
+    Tìm các pattern [1], [2], ... trong answer và khớp với metadata.
+    Bao gồm chapter và section từ heading hierarchy.
 
     Args:
         answer: Câu trả lời từ LLM (chứa [1], [2], ...).
@@ -260,7 +366,6 @@ def _extract_citations(
     Returns:
         List[Citation]: Danh sách trích dẫn nguồn.
     """
-    # Tìm tất cả số trong dấu ngoặc vuông: [1], [2], [3], ...
     cited_indices = set()
     matches = re.findall(r"\[(\d+)\]", answer)
 
@@ -269,7 +374,6 @@ def _extract_citations(
         if 1 <= idx <= len(results):
             cited_indices.add(idx)
 
-    # Xây dựng danh sách Citation từ metadata các chunks được trích dẫn
     citations = []
     for idx in sorted(cited_indices):
         result = results[idx - 1]  # Convert 1-indexed → 0-indexed
@@ -279,7 +383,9 @@ def _extract_citations(
             Citation(
                 doc_id=payload.get("doc_id", "unknown"),
                 page_number=payload.get("page_number", 0),
-                snippet=payload.get("text", "")[:200],  # Lấy 200 ký tự đầu
+                snippet=payload.get("text", "")[:200],
+                chapter=payload.get("chapter"),
+                section=payload.get("section"),
             )
         )
 
