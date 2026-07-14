@@ -1,16 +1,24 @@
 """
 services/ingestion.py
 ---------------------
-Xử lý luồng Ingestion: đọc PDF → chia chunks → embedding → lưu vào Qdrant.
-Mỗi chunk được gắn metadata (doc_id, subject_id, page_number) để hỗ trợ
-filter và trích dẫn nguồn khi truy vấn.
+Xử lý luồng Ingestion: đọc PDF → chia chunks phân cấp → embedding → lưu vào Qdrant.
+
+Phiên bản v2:
+- Sử dụng SentenceSplitter của LlamaIndex thay cho TextSplitter tự viết.
+- Trích xuất Heading hierarchy (H1→chapter, H2/H3→section) từ nội dung PDF.
+- Mỗi chunk được gắn metadata: doc_id, subject_id, page_number, chapter, section.
+- Hỗ trợ teacher_metadata bổ sung.
 """
 
 import logging
+import re
 import uuid
 from pathlib import Path
 
 from qdrant_client import models
+
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import Document as LlamaDocument
 
 from core.config import get_settings
 from core.database import get_qdrant_client
@@ -25,12 +33,13 @@ async def ingest_document(request: IngestRequest) -> IngestResponse:
     Luồng chính xử lý nạp tài liệu vào Qdrant.
 
     Bước 1: Đọc nội dung file PDF (từng trang).
-    Bước 2: Chia nhỏ nội dung thành các chunks với metadata.
-    Bước 3: Tạo vector embedding cho từng chunk.
-    Bước 4: Lưu tất cả vectors + metadata vào Qdrant collection chung.
+    Bước 2: Trích xuất heading hierarchy (chapter/section) từ text.
+    Bước 3: Chia nhỏ bằng SentenceSplitter (LlamaIndex) với metadata.
+    Bước 4: Tạo vector embedding cho từng chunk.
+    Bước 5: Lưu tất cả vectors + metadata vào Qdrant.
 
     Args:
-        request: IngestRequest chứa doc_id, subject_id, file_path.
+        request: IngestRequest chứa doc_id, subject_id, file_path, teacher_metadata.
 
     Returns:
         IngestResponse với trạng thái và số lượng chunks đã lưu.
@@ -56,16 +65,25 @@ async def ingest_document(request: IngestRequest) -> IngestResponse:
 
     logger.info("Đã đọc %d trang từ PDF", len(pages))
 
-    # ── Bước 2: Chia thành chunks kèm metadata ────────────────────
-    chunks = _split_into_chunks(
+    # ── Bước 2: Trích xuất heading hierarchy + tạo LlamaIndex Documents ──
+    documents = _build_documents_with_headings(
         pages=pages,
         doc_id=request.doc_id,
         subject_id=request.subject_id,
+        teacher_metadata=request.teacher_metadata or {},
+    )
+
+    logger.info("Đã tạo %d documents với heading metadata", len(documents))
+
+    # ── Bước 3: Chia chunks bằng SentenceSplitter (LlamaIndex) ────
+    splitter = SentenceSplitter(
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,
     )
 
-    if not chunks:
+    nodes = splitter.get_nodes_from_documents(documents)
+
+    if not nodes:
         logger.warning("Không tạo được chunk nào từ tài liệu")
         return IngestResponse(
             status="warning",
@@ -73,11 +91,11 @@ async def ingest_document(request: IngestRequest) -> IngestResponse:
             chunks_count=0,
         )
 
-    logger.info("Đã chia thành %d chunks", len(chunks))
+    logger.info("SentenceSplitter tạo ra %d nodes/chunks", len(nodes))
 
-    # ── Bước 3: Tạo embeddings cho tất cả chunks ──────────────────
+    # ── Bước 4: Tạo embeddings cho tất cả chunks ──────────────────
     embed_model = get_embedding_model()
-    texts = [chunk["text"] for chunk in chunks]
+    texts = [node.get_content() for node in nodes]
 
     try:
         embeddings = await embed_model.aget_text_embedding_batch(texts)
@@ -87,20 +105,26 @@ async def ingest_document(request: IngestRequest) -> IngestResponse:
 
     logger.info("Đã tạo embeddings cho %d chunks ✓", len(embeddings))
 
-    # ── Bước 4: Lưu vào Qdrant ────────────────────────────────────
+    # ── Bước 5: Lưu vào Qdrant ────────────────────────────────────
     client = await get_qdrant_client()
 
     points = []
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    for i, (node, embedding) in enumerate(zip(nodes, embeddings)):
+        metadata = node.metadata
+
         point = models.PointStruct(
-            id=str(uuid.uuid4()),  # ID duy nhất cho mỗi vector
+            id=str(uuid.uuid4()),
             vector=embedding,
             payload={
-                "text": chunk["text"],
-                "doc_id": chunk["doc_id"],
-                "subject_id": chunk["subject_id"],
-                "page_number": chunk["page_number"],
+                "text": node.get_content(),
+                "doc_id": metadata.get("doc_id", request.doc_id),
+                "subject_id": metadata.get("subject_id", request.subject_id),
+                "page_number": metadata.get("page_number", 0),
+                "chapter": metadata.get("chapter", ""),
+                "section": metadata.get("section", ""),
                 "chunk_index": i,
+                # Teacher metadata gộp vào payload
+                **{f"teacher_{k}": v for k, v in (request.teacher_metadata or {}).items()},
             },
         )
         points.append(point)
@@ -133,6 +157,10 @@ async def ingest_document(request: IngestRequest) -> IngestResponse:
     )
 
 
+# ══════════════════════════════════════════════════════════════════
+# HÀM PHỤ TRỢ (PRIVATE HELPERS)
+# ══════════════════════════════════════════════════════════════════
+
 def _read_pdf(file_path: str) -> list[dict]:
     """
     Đọc file PDF và trả về danh sách các trang.
@@ -146,6 +174,7 @@ def _read_pdf(file_path: str) -> list[dict]:
 
     Raises:
         FileNotFoundError: Nếu file không tồn tại.
+        ValueError: Nếu file không phải PDF.
     """
     path = Path(file_path)
 
@@ -178,132 +207,140 @@ def _read_pdf(file_path: str) -> list[dict]:
         raise
 
 
-def _split_into_chunks(
+def _extract_headings(text: str) -> dict:
+    """
+    Trích xuất heading hierarchy từ text của một trang PDF.
+    Nhận diện các pattern heading phổ biến trong tài liệu giáo dục:
+
+    H1 (Chapter):
+      - "Chương 1: ...", "CHƯƠNG I: ...", "Chapter 1: ..."
+      - Dòng VIẾT HOA TOÀN BỘ (>= 5 ký tự, <= 100 ký tự)
+
+    H2/H3 (Section):
+      - "1.1 ...", "1.1. ...", "I.1. ..."
+      - "Phần 1: ...", "Bài 1: ..."
+
+    Args:
+        text: Nội dung text của một trang.
+
+    Returns:
+        dict: {"chapter": str | None, "section": str | None}
+    """
+    chapter = None
+    section = None
+
+    lines = text.split("\n")
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # ── Nhận diện H1 (Chapter) ───────────────────────────────
+        # Pattern: "Chương X:", "CHƯƠNG X:", "Chapter X:"
+        chapter_match = re.match(
+            r"^(?:Chương|CHƯƠNG|Chapter)\s+[\dIVXivx]+[:\.\s]?\s*(.+)",
+            stripped,
+            re.IGNORECASE,
+        )
+        if chapter_match:
+            chapter = stripped
+            continue
+
+        # Pattern: Dòng VIẾT HOA hoàn toàn (tiêu đề chương)
+        if (
+            stripped.isupper()
+            and 5 <= len(stripped) <= 100
+            and not stripped.startswith(("HTTP", "URL", "ISBN"))
+        ):
+            chapter = stripped
+            continue
+
+        # ── Nhận diện H2/H3 (Section) ───────────────────────────
+        # Pattern: "1.1 ...", "1.1. ...", "2.3.1 ..."
+        section_match = re.match(
+            r"^(\d+(?:\.\d+)+)\.?\s+(.+)",
+            stripped,
+        )
+        if section_match:
+            section = stripped
+            continue
+
+        # Pattern: "Phần X:", "Bài X:", "Mục X:"
+        section_match2 = re.match(
+            r"^(?:Phần|Bài|Mục|Section)\s+[\dIVXivx]+[:\.\s]?\s*(.+)",
+            stripped,
+            re.IGNORECASE,
+        )
+        if section_match2:
+            section = stripped
+            continue
+
+    return {"chapter": chapter, "section": section}
+
+
+def _build_documents_with_headings(
     pages: list[dict],
     doc_id: str,
     subject_id: str,
-    chunk_size: int = 512,
-    chunk_overlap: int = 50,
-) -> list[dict]:
+    teacher_metadata: dict,
+) -> list[LlamaDocument]:
     """
-    Chia nội dung các trang thành các chunks nhỏ hơn.
-    Sử dụng thuật toán RecursiveCharacterTextSplitter đơn giản:
-    chia theo ký tự với overlap giữa các chunks liền kề.
+    Chuyển đổi các trang PDF thành LlamaIndex Documents, kèm theo
+    heading metadata (chapter, section) được trích xuất từ nội dung.
 
-    Mỗi chunk luôn kèm metadata:
-    - doc_id: ID tài liệu gốc
-    - subject_id: ID môn học (dùng để filter trong Qdrant)
-    - page_number: Số trang nguồn
+    Heading có tính kế thừa: chapter/section ở trang trước sẽ được
+    kế thừa cho các trang sau nếu trang sau không có heading mới.
 
     Args:
-        pages: Danh sách các trang đã đọc từ PDF.
-        doc_id: ID của tài liệu.
+        pages: Danh sách trang đã đọc từ PDF.
+        doc_id: ID tài liệu.
         subject_id: ID môn học.
-        chunk_size: Kích thước tối đa mỗi chunk (ký tự).
-        chunk_overlap: Số ký tự overlap giữa 2 chunks liên tiếp.
+        teacher_metadata: Metadata bổ sung từ giáo viên.
 
     Returns:
-        List[dict]: Danh sách chunks, mỗi chunk là dict chứa text + metadata.
+        List[LlamaDocument]: Documents sẵn sàng đưa vào SentenceSplitter.
     """
-    chunks = []
+    documents = []
 
-    # Dấu phân tách ưu tiên: đoạn văn → câu → dấu phẩy → khoảng trắng
-    separators = ["\n\n", "\n", ". ", ", ", " "]
+    # Heading kế thừa: trang sau dùng heading trang trước nếu không có heading mới
+    current_chapter = None
+    current_section = None
 
     for page in pages:
         text = page["text"]
         page_number = page["page_number"]
 
-        # Chia text của trang thành các chunks
-        page_chunks = _recursive_split(text, chunk_size, chunk_overlap, separators)
+        # Trích xuất heading từ trang hiện tại
+        headings = _extract_headings(text)
 
-        for chunk_text in page_chunks:
-            chunk_text = chunk_text.strip()
-            if len(chunk_text) < 20:
-                # Bỏ qua các chunk quá ngắn (nhiễu)
-                continue
+        # Cập nhật heading hiện tại (kế thừa nếu không tìm thấy mới)
+        if headings["chapter"]:
+            current_chapter = headings["chapter"]
+            current_section = None  # Reset section khi vào chapter mới
+        if headings["section"]:
+            current_section = headings["section"]
 
-            chunks.append({
-                "text": chunk_text,
-                "doc_id": doc_id,
-                "subject_id": subject_id,
-                "page_number": page_number,
-            })
+        # Tạo LlamaIndex Document với metadata đầy đủ
+        metadata = {
+            "doc_id": doc_id,
+            "subject_id": subject_id,
+            "page_number": page_number,
+            "chapter": current_chapter or "",
+            "section": current_section or "",
+        }
 
-    return chunks
+        doc = LlamaDocument(
+            text=text,
+            metadata=metadata,
+        )
+        documents.append(doc)
 
+    logger.info(
+        "Xây dựng %d documents: last_chapter='%s', last_section='%s'",
+        len(documents),
+        current_chapter or "N/A",
+        current_section or "N/A",
+    )
 
-def _recursive_split(
-    text: str,
-    chunk_size: int,
-    chunk_overlap: int,
-    separators: list[str],
-) -> list[str]:
-    """
-    Thuật toán chia text đệ quy theo danh sách dấu phân tách ưu tiên.
-    Ưu tiên giữ nguyên cấu trúc đoạn văn / câu khi chia.
-
-    Args:
-        text: Văn bản cần chia.
-        chunk_size: Kích thước tối đa.
-        chunk_overlap: Số ký tự chồng lấp.
-        separators: Danh sách dấu phân tách theo thứ tự ưu tiên.
-
-    Returns:
-        List[str]: Danh sách các đoạn text đã chia.
-    """
-    # Nếu text đã đủ ngắn, trả về nguyên
-    if len(text) <= chunk_size:
-        return [text] if text.strip() else []
-
-    # Tìm separator phù hợp nhất (ưu tiên từ trái sang phải)
-    chosen_separator = separators[-1] if separators else ""
-    for sep in separators:
-        if sep in text:
-            chosen_separator = sep
-            break
-
-    # Chia text theo separator đã chọn
-    parts = text.split(chosen_separator)
-    chunks = []
-    current_chunk = ""
-
-    for part in parts:
-        # Thêm separator lại (trừ trường hợp separator là khoảng trắng)
-        candidate = part if not current_chunk else current_chunk + chosen_separator + part
-
-        if len(candidate) <= chunk_size:
-            current_chunk = candidate
-        else:
-            # Lưu chunk hiện tại nếu có nội dung
-            if current_chunk.strip():
-                chunks.append(current_chunk)
-
-            # Nếu phần hiện tại vẫn lớn hơn chunk_size,
-            # đệ quy chia tiếp với separator nhỏ hơn
-            if len(part) > chunk_size:
-                remaining_seps = separators[separators.index(chosen_separator) + 1:] if chosen_separator in separators else []
-                if remaining_seps:
-                    sub_chunks = _recursive_split(part, chunk_size, chunk_overlap, remaining_seps)
-                    chunks.extend(sub_chunks)
-                else:
-                    # Không còn separator nào → cắt cứng
-                    for i in range(0, len(part), chunk_size - chunk_overlap):
-                        chunks.append(part[i : i + chunk_size])
-                current_chunk = ""
-            else:
-                current_chunk = part
-
-    # Thêm chunk cuối cùng
-    if current_chunk.strip():
-        chunks.append(current_chunk)
-
-    # Áp dụng overlap: thêm phần đuôi chunk trước vào đầu chunk sau
-    if chunk_overlap > 0 and len(chunks) > 1:
-        overlapped_chunks = [chunks[0]]
-        for i in range(1, len(chunks)):
-            prev_tail = chunks[i - 1][-chunk_overlap:]
-            overlapped_chunks.append(prev_tail + chunks[i])
-        chunks = overlapped_chunks
-
-    return chunks
+    return documents

@@ -4,8 +4,12 @@ api/routes.py
 Định nghĩa các API endpoints chính cho RAG microservice.
 Giao tiếp nội bộ với Node.js backend qua HTTP.
 
+Phiên bản v2:
+- Query endpoint: tích hợp Query Router (CHIT_CHAT / RAG_REQUIRED).
+- Bỏ subject_id khỏi query log (Single-turn, Global Search).
+
 Endpoints:
-  POST /api/query   — Truy vấn RAG: hỏi-đáp dựa trên tài liệu
+  POST /api/query   — Truy vấn RAG (có router phân loại intent)
   POST /api/ingest  — Nạp tài liệu: đọc PDF, chia chunks, lưu vectors
   GET  /api/health  — Health check cho monitoring
 """
@@ -31,41 +35,40 @@ router = APIRouter(prefix="/api", tags=["RAG"])
 
 
 # ══════════════════════════════════════════════════════════════════
-# ENDPOINT 1: Truy vấn RAG
+# ENDPOINT 1: Truy vấn RAG (với Query Router)
 # ══════════════════════════════════════════════════════════════════
 
 @router.post(
     "/query",
     response_model=QueryResponse,
-    summary="Truy vấn RAG — Hỏi đáp dựa trên tài liệu",
+    summary="Truy vấn RAG — Hỏi đáp với Query Router",
     description=(
-        "Nhận câu hỏi từ người dùng, tìm kiếm ngữ cảnh liên quan trong "
-        "Qdrant (filter theo subject_id), và sử dụng Gemini LLM để sinh "
+        "Nhận câu hỏi từ người dùng. Query Router sẽ phân loại intent:\n"
+        "- CHIT_CHAT → LLM trả lời giao tiếp bình thường.\n"
+        "- RAG_REQUIRED → Tìm kiếm Global trong Qdrant + Gemini LLM sinh "
         "câu trả lời kèm trích dẫn nguồn."
     ),
 )
 async def query_endpoint(request: QueryRequest) -> QueryResponse:
     """
-    Xử lý truy vấn RAG.
+    Xử lý truy vấn với Query Router.
 
     Luồng xử lý:
-    1. Validate request (Pydantic tự động xử lý).
-    2. Gọi RAG engine để tìm kiếm + sinh câu trả lời.
-    3. Trả về QueryResponse kèm citations.
-
-    Nếu không tìm thấy thông tin → trả no_answer=True.
+    1. Validate request (Pydantic tự động).
+    2. Query Router phân loại intent.
+    3. Rẽ nhánh: CHIT_CHAT → giao tiếp | RAG_REQUIRED → RAG pipeline.
+    4. Trả về QueryResponse.
     """
     start_time = time.time()
 
     try:
         logger.info(
-            "[QUERY] Nhận request: subject=%s, conv=%s, q='%s'",
-            request.subject_id,
+            "[QUERY] Nhận request: conv=%s, q='%s'",
             request.conversation_id,
             request.question[:80],
         )
 
-        # Gọi RAG engine xử lý truy vấn
+        # Gọi RAG engine (có tích hợp Router bên trong)
         response = await process_query(request)
 
         elapsed = time.time() - start_time
@@ -107,11 +110,11 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
 @router.post(
     "/ingest",
     response_model=IngestResponse,
-    summary="Nạp tài liệu — Đọc PDF, chia chunks, lưu vectors",
+    summary="Nạp tài liệu — Đọc PDF, chia chunks phân cấp, lưu vectors",
     description=(
-        "Nhận thông tin tài liệu PDF, đọc nội dung, chia thành chunks, "
-        "tạo embeddings bằng Gemini, và lưu vào Qdrant với metadata "
-        "(doc_id, subject_id, page_number)."
+        "Nhận thông tin tài liệu PDF, đọc nội dung, trích xuất heading hierarchy "
+        "(chapter/section), chia chunks bằng SentenceSplitter (LlamaIndex), "
+        "tạo embeddings bằng Gemini, và lưu vào Qdrant với metadata đầy đủ."
     ),
 )
 async def ingest_endpoint(request: IngestRequest) -> IngestResponse:
@@ -120,7 +123,7 @@ async def ingest_endpoint(request: IngestRequest) -> IngestResponse:
 
     Luồng xử lý:
     1. Validate request (Pydantic tự động).
-    2. Đọc PDF → chia chunks → embedding → lưu Qdrant.
+    2. Đọc PDF → trích xuất headings → chia chunks → embedding → lưu Qdrant.
     3. Trả về IngestResponse với trạng thái và số chunks.
     """
     start_time = time.time()
@@ -185,5 +188,5 @@ async def health_check() -> dict:
     return {
         "status": "healthy",
         "service": "rag-education-service",
-        "version": "1.0.0",
+        "version": "2.0.0",
     }

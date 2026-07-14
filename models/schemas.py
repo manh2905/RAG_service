@@ -3,34 +3,48 @@ models/schemas.py
 -----------------
 Định nghĩa các Pydantic models dùng để validate dữ liệu
 giao tiếp giữa Python RAG service và Node.js backend.
+
+Phiên bản v2:
+- Thêm QueryIntent cho Query Router (phân loại CHIT_CHAT / RAG_REQUIRED).
+- QueryRequest chuyển sang Single-turn (bỏ history) + Global Search (bỏ subject_id).
+- IngestRequest hỗ trợ teacher_metadata.
+- Citation bổ sung chapter và section từ heading hierarchy.
 """
 
-from typing import List
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
+
+
+# ============================================================
+# ROUTER SCHEMA — Phân loại ý định câu hỏi
+# ============================================================
+
+class QueryIntent(BaseModel):
+    """
+    Kết quả phân loại ý định câu hỏi bởi Query Router.
+    LLM sẽ trả về Structured Output theo schema này.
+
+    - CHIT_CHAT:     Câu hỏi giao tiếp thông thường (chào hỏi, cảm ơn, ...).
+    - RAG_REQUIRED:  Câu hỏi cần tra cứu tài liệu để trả lời.
+    """
+    intent: Literal["CHIT_CHAT", "RAG_REQUIRED"] = Field(
+        ...,
+        description="Loại ý định: 'CHIT_CHAT' hoặc 'RAG_REQUIRED'"
+    )
 
 
 # ============================================================
 # INPUT SCHEMAS — Dữ liệu nhận từ Node.js
 # ============================================================
 
-class MessageHistory(BaseModel):
-    """Một lượt hội thoại trong lịch sử chat."""
-    role: str = Field(..., description="Vai trò: 'user' hoặc 'assistant'")
-    content: str = Field(..., description="Nội dung tin nhắn")
-
-
 class QueryRequest(BaseModel):
     """
     Request gửi tới endpoint /api/query.
-    Chứa câu hỏi, subject để lọc vector, và lịch sử hội thoại.
+    Chế độ Single-turn: chỉ chứa câu hỏi và conversation_id.
+    Tìm kiếm Global: không cần subject_id, search toàn bộ Vector DB.
     """
     question: str = Field(..., description="Câu hỏi của người dùng")
-    subject_id: str = Field(..., description="ID môn học để lọc vector trong Qdrant")
     conversation_id: str = Field(..., description="ID cuộc hội thoại hiện tại")
-    history: List[MessageHistory] = Field(
-        default=[],
-        description="Lịch sử hội thoại trước đó (tuỳ chọn)"
-    )
 
 
 class IngestRequest(BaseModel):
@@ -41,6 +55,10 @@ class IngestRequest(BaseModel):
     doc_id: str = Field(..., description="ID duy nhất của tài liệu")
     subject_id: str = Field(..., description="ID môn học mà tài liệu thuộc về")
     file_path: str = Field(..., description="Đường dẫn tuyệt đối tới file PDF trên server")
+    teacher_metadata: Optional[dict] = Field(
+        default={},
+        description="Metadata bổ sung từ giáo viên (tên tác giả, ghi chú, ...)"
+    )
 
 
 # ============================================================
@@ -48,10 +66,22 @@ class IngestRequest(BaseModel):
 # ============================================================
 
 class Citation(BaseModel):
-    """Trích dẫn nguồn từ tài liệu gốc."""
+    """
+    Trích dẫn nguồn từ tài liệu gốc.
+    Bao gồm thông tin heading hierarchy (chapter, section) để
+    người dùng dễ dàng tra cứu lại vị trí trong tài liệu.
+    """
     doc_id: str = Field(..., description="ID của tài liệu được trích dẫn")
     page_number: int = Field(..., description="Số trang chứa thông tin")
     snippet: str = Field(..., description="Đoạn trích ngắn từ tài liệu gốc")
+    chapter: Optional[str] = Field(
+        default=None,
+        description="Tên chương (H1) chứa đoạn trích dẫn"
+    )
+    section: Optional[str] = Field(
+        default=None,
+        description="Tên mục/phần (H2/H3) chứa đoạn trích dẫn"
+    )
 
 
 class QueryResponse(BaseModel):
