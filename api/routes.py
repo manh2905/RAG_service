@@ -1,31 +1,42 @@
 """
 api/routes.py
 -------------
-Định nghĩa các API endpoints chính cho RAG microservice.
+Định nghĩa các API endpoints cho RAG microservice.
 Giao tiếp nội bộ với Node.js backend qua HTTP.
 
-Phiên bản v2:
-- Query endpoint: tích hợp Query Router (CHIT_CHAT / RAG_REQUIRED).
-- Bỏ subject_id khỏi query log (Single-turn, Global Search).
+Phiên bản v3 — Theo sơ đồ luồng:
+  POST   /api/ingest              — Nạp tài liệu (async, 202)
+  POST   /api/query               — Chat/Query RAG (sync, 200)
+  PATCH  /api/docs/{doc_id}/visibility — Hide/Unhide (async, 202)
+  DELETE /api/ingest/{doc_id}      — Xóa vectors (async, 202)
+  GET    /api/health               — Health check
 
-Endpoints:
-  POST /api/query   — Truy vấn RAG (có router phân loại intent)
-  POST /api/ingest  — Nạp tài liệu: đọc PDF, chia chunks, lưu vectors
-  GET  /api/health  — Health check cho monitoring
+Error handling thống nhất dùng ErrorResponse.
 """
 
 import logging
 import time
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi.responses import JSONResponse
 
 from models.schemas import (
     IngestRequest,
-    IngestResponse,
+    IngestAcceptedResponse,
+    VisibilityRequest,
+    DeleteRequest,
+    AcceptedResponse,
     QueryRequest,
     QueryResponse,
+    ErrorResponse,
 )
-from services.ingestion import ingest_document
+from services.ingestion import ingest_document_background
+from services.doc_manager import (
+    hide_document_background,
+    unhide_document_background,
+    delete_document_background,
+)
 from services.rag_engine import process_query
 
 logger = logging.getLogger(__name__)
@@ -35,7 +46,69 @@ router = APIRouter(prefix="/api", tags=["RAG"])
 
 
 # ══════════════════════════════════════════════════════════════════
-# ENDPOINT 1: Truy vấn RAG (với Query Router)
+# HELPER: Error Response thống nhất
+# ══════════════════════════════════════════════════════════════════
+
+def _error_response(
+    status_code: int,
+    error_code: str,
+    message: str,
+) -> JSONResponse:
+    """Tạo error response theo format thống nhất."""
+    return JSONResponse(
+        status_code=status_code,
+        content=ErrorResponse(
+            error_code=error_code,
+            message=message,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ).model_dump(),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# ENDPOINT 1: Nạp tài liệu (Async — 202 Accepted)
+# ══════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/ingest",
+    response_model=IngestAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Nạp tài liệu — Async, trả 202 ngay, callback khi xong",
+    description=(
+        "Nhận request nạp tài liệu, trả 202 Accepted ngay lập tức. "
+        "Xử lý nền: Parse → Chunk → Embed → Lưu Qdrant. "
+        "Gọi callback_url khi hoàn tất (SUCCEEDED/FAILED)."
+    ),
+)
+async def ingest_endpoint(
+    request: IngestRequest,
+    background_tasks: BackgroundTasks,
+) -> IngestAcceptedResponse:
+    """
+    Xử lý nạp tài liệu vào Qdrant (async pattern).
+
+    Luồng: Trả 202 → Background task → Callback khi xong.
+    """
+    logger.info(
+        "[INGEST] Nhận request: doc_id=%s, job_id=%s, file=%s",
+        request.doc_id,
+        request.job_id,
+        request.file_path,
+    )
+
+    # Thêm task xử lý vào background
+    background_tasks.add_task(ingest_document_background, request)
+
+    # Trả 202 ngay lập tức
+    return IngestAcceptedResponse(
+        status="accepted",
+        job_id=request.job_id,
+        message=f"Tài liệu {request.doc_id} đang được xử lý",
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# ENDPOINT 2: Chat/Query RAG (Sync — 200 OK)
 # ══════════════════════════════════════════════════════════════════
 
 @router.post(
@@ -43,32 +116,24 @@ router = APIRouter(prefix="/api", tags=["RAG"])
     response_model=QueryResponse,
     summary="Truy vấn RAG — Hỏi đáp với Query Router",
     description=(
-        "Nhận câu hỏi từ người dùng. Query Router sẽ phân loại intent:\n"
-        "- CHIT_CHAT → LLM trả lời giao tiếp bình thường.\n"
-        "- RAG_REQUIRED → Tìm kiếm Global trong Qdrant + Gemini LLM sinh "
-        "câu trả lời kèm trích dẫn nguồn."
+        "Nhận câu hỏi + lịch sử hội thoại. Query Router phân loại intent:\n"
+        "- CHIT_CHAT → LLM trả lời giao tiếp.\n"
+        "- RAG_REQUIRED → Search READY+VISIBLE docs trong Qdrant → LLM → Citations.\n"
+        "Trả kèm usage (token counts) để Node.js lưu cho dashboard."
     ),
 )
 async def query_endpoint(request: QueryRequest) -> QueryResponse:
-    """
-    Xử lý truy vấn với Query Router.
-
-    Luồng xử lý:
-    1. Validate request (Pydantic tự động).
-    2. Query Router phân loại intent.
-    3. Rẽ nhánh: CHIT_CHAT → giao tiếp | RAG_REQUIRED → RAG pipeline.
-    4. Trả về QueryResponse.
-    """
+    """Xử lý truy vấn RAG (sync, trả kết quả ngay)."""
     start_time = time.time()
 
     try:
         logger.info(
-            "[QUERY] Nhận request: conv=%s, q='%s'",
+            "[QUERY] Nhận request: conv=%s, q='%s', history=%d msgs",
             request.conversation_id,
             request.question[:80],
+            len(request.history or []),
         )
 
-        # Gọi RAG engine (có tích hợp Router bên trong)
         response = await process_query(request)
 
         elapsed = time.time() - start_time
@@ -82,97 +147,119 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         return response
 
     except FileNotFoundError as e:
-        logger.error("[QUERY] File không tồn tại: %s", str(e))
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Không tìm thấy tài liệu: {str(e)}",
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "FILE_NOT_FOUND",
+            str(e),
         )
 
     except ValueError as e:
-        logger.error("[QUERY] Dữ liệu không hợp lệ: %s", str(e))
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Dữ liệu không hợp lệ: {str(e)}",
+        return _error_response(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "INVALID_INPUT",
+            str(e),
         )
 
     except Exception as e:
-        logger.exception("[QUERY] Lỗi không xác định khi xử lý query")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi server khi xử lý truy vấn: {str(e)}",
+        logger.exception("[QUERY] Lỗi không xác định")
+        return _error_response(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            f"Lỗi server khi xử lý truy vấn: {str(e)}",
         )
 
 
 # ══════════════════════════════════════════════════════════════════
-# ENDPOINT 2: Nạp tài liệu (Ingestion)
+# ENDPOINT 3: Hide/Unhide tài liệu (Async — 202 Accepted)
 # ══════════════════════════════════════════════════════════════════
 
-@router.post(
-    "/ingest",
-    response_model=IngestResponse,
-    summary="Nạp tài liệu — Đọc PDF, chia chunks phân cấp, lưu vectors",
+@router.patch(
+    "/docs/{doc_id}/visibility",
+    response_model=AcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ẩn/Hiện tài liệu — Bật/tắt truy xuất trong RAG",
     description=(
-        "Nhận thông tin tài liệu PDF, đọc nội dung, trích xuất heading hierarchy "
-        "(chapter/section), chia chunks bằng SentenceSplitter (LlamaIndex), "
-        "tạo embeddings bằng Gemini, và lưu vào Qdrant với metadata đầy đủ."
+        "Hide: set is_hidden=true → tài liệu không xuất hiện khi search.\n"
+        "Unhide: set is_hidden=false → tài liệu xuất hiện lại khi search.\n"
+        "Async: trả 202, callback khi xong."
     ),
 )
-async def ingest_endpoint(request: IngestRequest) -> IngestResponse:
-    """
-    Xử lý nạp tài liệu vào Qdrant.
+async def visibility_endpoint(
+    doc_id: str,
+    request: VisibilityRequest,
+    background_tasks: BackgroundTasks,
+) -> AcceptedResponse:
+    """Xử lý hide/unhide tài liệu (async pattern)."""
+    logger.info(
+        "[VISIBILITY] Nhận request: doc_id=%s, action=%s, job_id=%s",
+        doc_id,
+        request.action,
+        request.job_id,
+    )
 
-    Luồng xử lý:
-    1. Validate request (Pydantic tự động).
-    2. Đọc PDF → trích xuất headings → chia chunks → embedding → lưu Qdrant.
-    3. Trả về IngestResponse với trạng thái và số chunks.
-    """
-    start_time = time.time()
-
-    try:
-        logger.info(
-            "[INGEST] Nhận request: doc_id=%s, subject=%s, file=%s",
-            request.doc_id,
-            request.subject_id,
-            request.file_path,
+    if request.action == "hide":
+        background_tasks.add_task(
+            hide_document_background,
+            doc_id=doc_id,
+            job_id=request.job_id,
+            callback_url=request.callback_url,
+        )
+    else:  # unhide
+        background_tasks.add_task(
+            unhide_document_background,
+            doc_id=doc_id,
+            job_id=request.job_id,
+            callback_url=request.callback_url,
         )
 
-        # Gọi service xử lý ingestion
-        response = await ingest_document(request)
-
-        elapsed = time.time() - start_time
-        logger.info(
-            "[INGEST] Hoàn tất trong %.2fs | status=%s | chunks=%d",
-            elapsed,
-            response.status,
-            response.chunks_count,
-        )
-
-        return response
-
-    except FileNotFoundError as e:
-        logger.error("[INGEST] File không tồn tại: %s", str(e))
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Không tìm thấy file: {str(e)}",
-        )
-
-    except ValueError as e:
-        logger.error("[INGEST] File không hợp lệ: %s", str(e))
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"File không hợp lệ: {str(e)}",
-        )
-
-    except Exception as e:
-        logger.exception("[INGEST] Lỗi không xác định khi xử lý ingestion")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi server khi nạp tài liệu: {str(e)}",
-        )
+    return AcceptedResponse(
+        status="accepted",
+        job_id=request.job_id,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
-# ENDPOINT 3: Health Check
+# ENDPOINT 4: Xóa tài liệu (Async — 202 Accepted)
+# ══════════════════════════════════════════════════════════════════
+
+@router.delete(
+    "/ingest/{doc_id}",
+    response_model=AcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Xóa vectors tài liệu — Dọn dẹp Qdrant",
+    description=(
+        "Xóa toàn bộ vectors có doc_id khỏi Qdrant.\n"
+        "File gốc và lịch sử MySQL vẫn được giữ (Node.js quản lý).\n"
+        "Async: trả 202, callback khi xong."
+    ),
+)
+async def delete_endpoint(
+    doc_id: str,
+    request: DeleteRequest,
+    background_tasks: BackgroundTasks,
+) -> AcceptedResponse:
+    """Xử lý xóa vectors tài liệu (async pattern)."""
+    logger.info(
+        "[DELETE] Nhận request: doc_id=%s, job_id=%s",
+        doc_id,
+        request.job_id,
+    )
+
+    background_tasks.add_task(
+        delete_document_background,
+        doc_id=doc_id,
+        job_id=request.job_id,
+        callback_url=request.callback_url,
+    )
+
+    return AcceptedResponse(
+        status="accepted",
+        job_id=request.job_id,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# ENDPOINT 5: Health Check
 # ══════════════════════════════════════════════════════════════════
 
 @router.get(
@@ -181,12 +268,9 @@ async def ingest_endpoint(request: IngestRequest) -> IngestResponse:
     description="Endpoint để monitoring/load balancer kiểm tra service còn hoạt động.",
 )
 async def health_check() -> dict:
-    """
-    Trả về trạng thái hoạt động của service.
-    Có thể mở rộng để kiểm tra kết nối Qdrant, Gemini API, v.v.
-    """
+    """Trả về trạng thái hoạt động của service."""
     return {
         "status": "healthy",
         "service": "rag-education-service",
-        "version": "2.0.0",
+        "version": "3.0.0",
     }

@@ -88,7 +88,7 @@ app = FastAPI(
         "Microservice xử lý RAG (Retrieval-Augmented Generation) "
         "cho hệ thống Trợ lý Giáo dục. Giao tiếp nội bộ với Node.js backend."
     ),
-    version="1.0.0",
+    version="3.0.0",
     lifespan=lifespan,
     docs_url="/docs",       # Swagger UI tại /docs
     redoc_url="/redoc",     # ReDoc tại /redoc
@@ -120,7 +120,7 @@ async def root():
     """Endpoint gốc — hiển thị thông tin cơ bản về service."""
     return {
         "service": "RAG Education Service",
-        "version": "1.0.0",
+        "version": "3.0.0",
         "docs": "/docs",
         "health": "/api/health",
     }

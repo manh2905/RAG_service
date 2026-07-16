@@ -3,9 +3,15 @@ core/config.py
 --------------
 Quản lý biến môi trường cho toàn bộ ứng dụng.
 Sử dụng pydantic-settings để tự động load từ file .env.
+
+Phiên bản v3:
+- Thêm LLAMA_CLOUD_API_KEY cho LlamaParse.
+- Thêm INTERNAL_SECRET cho callback auth.
+- Thêm CALLBACK_TIMEOUT, CALLBACK_MAX_RETRIES cho callback mechanism.
 """
 
 from functools import lru_cache
+# pyrefly: ignore [missing-import]
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +29,9 @@ class Settings(BaseSettings):
 
     # === Google Gemini API ===
     GOOGLE_API_KEY: str = ""
+
+    # === LlamaParse (LlamaIndex Cloud) ===
+    LLAMA_CLOUD_API_KEY: str = ""
 
     # === Tên model Gemini ===
     GEMINI_LLM_MODEL: str = "models/gemini-2.0-flash"
@@ -44,6 +53,11 @@ class Settings(BaseSettings):
 
     # === Embedding Dimension (text-embedding-004 trả về 768 chiều) ===
     EMBEDDING_DIMENSION: int = 768
+
+    # === Callback — gọi ngược Node.js sau khi xử lý xong ===
+    INTERNAL_SECRET: str = "change-me-in-production"
+    CALLBACK_TIMEOUT: int = 30      # seconds
+    CALLBACK_MAX_RETRIES: int = 3
 
 
 @lru_cache()

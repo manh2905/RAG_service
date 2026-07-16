@@ -2,11 +2,15 @@
 core/database.py
 ----------------
 Khởi tạo và quản lý kết nối Singleton tới Qdrant Vector Database.
-Đảm bảo chỉ có một instance QdrantClient duy nhất trong toàn bộ app,
-và tự động tạo collection nếu chưa tồn tại.
+Tự động tạo collection và payload indexes nếu chưa tồn tại.
+
+Phiên bản v3:
+- Thêm payload index cho doc_id (tăng tốc filter/delete).
+- Thêm payload index cho is_hidden (tăng tốc filter khi search).
 """
 
 import logging
+# pyrefly: ignore [missing-import]
 from qdrant_client import QdrantClient, models
 from core.config import get_settings
 
@@ -20,10 +24,7 @@ async def get_qdrant_client() -> QdrantClient:
     """
     Lấy hoặc tạo QdrantClient singleton.
     Nếu client chưa tồn tại, khởi tạo kết nối mới tới Qdrant server
-    và tạo collection nếu cần.
-
-    Returns:
-        QdrantClient: Instance kết nối tới Qdrant.
+    và tạo collection + indexes nếu cần.
     """
     global _qdrant_client
 
@@ -64,12 +65,7 @@ async def _ensure_collection_exists(
 ) -> None:
     """
     Kiểm tra collection đã tồn tại chưa.
-    Nếu chưa → tạo mới với cấu hình Cosine similarity.
-
-    Args:
-        client: QdrantClient instance.
-        collection_name: Tên collection cần kiểm tra/tạo.
-        vector_size: Số chiều của vector embedding.
+    Nếu chưa → tạo mới với Cosine similarity + payload indexes.
     """
     try:
         collections = client.get_collections().collections
@@ -86,12 +82,8 @@ async def _ensure_collection_exists(
                 ),
             )
 
-            # Tạo index cho trường subject_id để tăng tốc filter
-            client.create_payload_index(
-                collection_name=collection_name,
-                field_name="subject_id",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
+            # Tạo payload indexes để tăng tốc filter/delete
+            _create_payload_indexes(client, collection_name)
 
             logger.info("Đã tạo collection '%s' với %d chiều vector ✓", collection_name, vector_size)
         else:
@@ -102,11 +94,28 @@ async def _ensure_collection_exists(
         raise
 
 
+def _create_payload_indexes(client: QdrantClient, collection_name: str) -> None:
+    """Tạo payload indexes cho các field thường dùng để filter."""
+    indexes = [
+        ("doc_id", models.PayloadSchemaType.KEYWORD),
+        ("subject_id", models.PayloadSchemaType.KEYWORD),
+        ("is_hidden", models.PayloadSchemaType.BOOL),
+    ]
+
+    for field_name, schema_type in indexes:
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=schema_type,
+            )
+            logger.info("Đã tạo index cho field '%s' ✓", field_name)
+        except Exception as e:
+            logger.warning("Không tạo được index cho '%s': %s", field_name, str(e))
+
+
 async def close_qdrant_client() -> None:
-    """
-    Đóng kết nối tới Qdrant khi shutdown app.
-    Giải phóng tài nguyên một cách an toàn.
-    """
+    """Đóng kết nối tới Qdrant khi shutdown app."""
     global _qdrant_client
 
     if _qdrant_client is not None:

@@ -1,22 +1,36 @@
 # === Framework ===
-fastapi==0.115.12
-uvicorn[standard]==0.34.3
-python-multipart==0.0.20
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.18
 
 # === Data Validation ===
-pydantic==2.11.4
-pydantic-settings==2.9.1
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
 
 # === Vector Database ===
 qdrant-client==1.14.2
 
 # === LLM / RAG Framework ===
-llama-index==0.12.23
-llama-index-llms-gemini==0.5.1
-llama-index-embeddings-gemini==0.5.1
+llama-index>=0.11.0
+llama-index-llms-gemini>=0.3.0
+llama-index-embeddings-gemini>=0.3.0
 
-# === PDF Processing ===
+# === Document Parsing ===
+llama-parse==0.6.4
 pypdf==5.6.0
+python-docx==1.1.2
+
+# === Vietnamese NLP ===
+# underthesea==6.8.4
+
+
+# === HTTP Client (callback) ===
+httpx==0.28.1
 
 # === Utilities ===
 python-dotenv==1.1.1
+
+# === Testing ===
+pytest==8.3.5
+pytest-asyncio==0.25.3
+httpx  # also used by TestClient
