@@ -18,9 +18,10 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Depends
 from fastapi.responses import JSONResponse
 
+from api.dependencies import verify_internal_token
 from models.schemas import (
     IngestRequest,
     IngestAcceptedResponse,
@@ -42,8 +43,9 @@ from services.rag_engine import process_query
 logger = logging.getLogger(__name__)
 
 # ── Khởi tạo router với prefix chung ────────────────────────────
-router = APIRouter(prefix="/api", tags=["RAG"])
-
+# Router bảo vệ bằng token (tất cả trừ health)
+router = APIRouter(prefix="/api", tags=["RAG"], dependencies=[Depends(verify_internal_token)])
+public_router = APIRouter(prefix="/api", tags=["Public"])
 
 # ══════════════════════════════════════════════════════════════════
 # HELPER: Error Response thống nhất
@@ -202,6 +204,7 @@ async def visibility_endpoint(
             hide_document_background,
             doc_id=doc_id,
             job_id=request.job_id,
+            attempt_count=request.attempt_count,
             callback_url=request.callback_url,
         )
     else:  # unhide
@@ -209,6 +212,7 @@ async def visibility_endpoint(
             unhide_document_background,
             doc_id=doc_id,
             job_id=request.job_id,
+            attempt_count=request.attempt_count,
             callback_url=request.callback_url,
         )
 
@@ -249,6 +253,7 @@ async def delete_endpoint(
         delete_document_background,
         doc_id=doc_id,
         job_id=request.job_id,
+        attempt_count=request.attempt_count,
         callback_url=request.callback_url,
     )
 
@@ -262,7 +267,7 @@ async def delete_endpoint(
 # ENDPOINT 5: Health Check
 # ══════════════════════════════════════════════════════════════════
 
-@router.get(
+@public_router.get(
     "/health",
     summary="Kiểm tra trạng thái service",
     description="Endpoint để monitoring/load balancer kiểm tra service còn hoạt động.",

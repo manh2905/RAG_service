@@ -18,6 +18,7 @@ Phiên bản v3:
 
 import logging
 import uuid
+import hashlib
 
 # pyrefly: ignore [missing-import]
 from qdrant_client import models
@@ -58,25 +59,26 @@ async def ingest_document_background(request: IngestRequest) -> None:
     settings = get_settings()
     callback_url = request.callback_url
     job_id = request.job_id
+    attempt_count = request.attempt_count
 
     try:
         # ── Bước 1: Parse tài liệu ────────────────────────────────
-        await send_progress(callback_url, job_id, "parsing")
+        await send_progress(callback_url, job_id, attempt_count, "parsing")
 
         logger.info("[INGEST] Parsing file: %s", request.file_path)
         pages = await parse_document(request.file_path)
 
         if not pages:
             await send_failed(
-                callback_url, job_id,
-                "EMPTY_DOCUMENT", "Không đọc được nội dung từ file"
+                callback_url, job_id, attempt_count,
+                "EMPTY_DOCUMENT", "Không đọc được nội dung từ file", stage="parsing"
             )
             return
 
         logger.info("[INGEST] Đã parse %d pages", len(pages))
 
         # ── Bước 2: Chia chunks ───────────────────────────────────
-        await send_progress(callback_url, job_id, "chunking")
+        await send_progress(callback_url, job_id, attempt_count, "chunking")
 
         documents = _build_llama_documents(
             pages=pages,
@@ -93,15 +95,15 @@ async def ingest_document_background(request: IngestRequest) -> None:
 
         if not nodes:
             await send_failed(
-                callback_url, job_id,
-                "NO_CHUNKS", "Tài liệu không có đủ nội dung để chia chunks"
+                callback_url, job_id, attempt_count,
+                "NO_CHUNKS", "Tài liệu không có đủ nội dung để chia chunks", stage="chunking"
             )
             return
 
         logger.info("[INGEST] Tạo được %d chunks", len(nodes))
 
         # ── Bước 3: Embedding ─────────────────────────────────────
-        await send_progress(callback_url, job_id, "embedding")
+        await send_progress(callback_url, job_id, attempt_count, "embedding")
 
         embed_model = get_embedding_model()
         texts = [node.get_content() for node in nodes]
@@ -110,15 +112,15 @@ async def ingest_document_background(request: IngestRequest) -> None:
             embeddings = await embed_model.aget_text_embedding_batch(texts)
         except Exception as e:
             await send_failed(
-                callback_url, job_id,
-                "EMBEDDING_ERROR", f"Lỗi khi tạo embedding: {str(e)}"
+                callback_url, job_id, attempt_count,
+                "EMBEDDING_ERROR", f"Lỗi khi tạo embedding: {str(e)}", stage="embedding"
             )
             return
 
         logger.info("[INGEST] Đã tạo embeddings cho %d chunks", len(embeddings))
 
         # ── Bước 4: Lưu vào Qdrant ───────────────────────────────
-        await send_progress(callback_url, job_id, "indexing")
+        await send_progress(callback_url, job_id, attempt_count, "indexing")
 
         client = await get_qdrant_client()
         points = []
@@ -127,17 +129,20 @@ async def ingest_document_background(request: IngestRequest) -> None:
         for i, (node, embedding) in enumerate(zip(nodes, embeddings)):
             metadata = node.metadata
             chunk_id = str(uuid.uuid4())
+            chunk_text = node.get_content()
+            content_hash = hashlib.sha256(chunk_text.encode('utf-8')).hexdigest()
+            token_count = len(chunk_text.split())
 
             point = models.PointStruct(
                 id=chunk_id,
                 vector=embedding,
                 payload={
-                    "text": node.get_content(),
+                    "text": chunk_text,
                     "doc_id": metadata.get("doc_id", request.doc_id),
                     "subject_id": metadata.get("subject_id", request.subject_id),
-                    "page_number": metadata.get("page_number", 0),
-                    "chapter": metadata.get("chapter", ""),
-                    "section": metadata.get("section", ""),
+                    "page_number": metadata.get("page_number"),
+                    "chapter": metadata.get("chapter"),
+                    "section": metadata.get("section"),
                     "chunk_index": i,
                     "is_hidden": False,  # Mặc định VISIBLE
                     # Teacher metadata
@@ -151,10 +156,13 @@ async def ingest_document_background(request: IngestRequest) -> None:
                 ChunkManifestItem(
                     chunk_id=chunk_id,
                     chunk_index=i,
-                    page_number=metadata.get("page_number", 0),
-                    chapter=metadata.get("chapter", ""),
-                    section=metadata.get("section", ""),
-                    text_preview=node.get_content()[:50],
+                    chunk_text=chunk_text,
+                    content_hash=content_hash,
+                    token_count=token_count,
+                    page_number=metadata.get("page_number"),
+                    chapter=metadata.get("chapter"),
+                    section=metadata.get("section"),
+                    text_preview=chunk_text[:50],
                 )
             )
 
@@ -173,6 +181,7 @@ async def ingest_document_background(request: IngestRequest) -> None:
         await send_succeeded_ingest(
             callback_url=callback_url,
             job_id=job_id,
+            attempt_count=attempt_count,
             chunks_count=len(points),
             chunk_manifest=[m.model_dump() for m in chunk_manifest],
         )
@@ -181,15 +190,15 @@ async def ingest_document_background(request: IngestRequest) -> None:
 
     except FileNotFoundError as e:
         logger.error("[INGEST] File không tồn tại: %s", str(e))
-        await send_failed(callback_url, job_id, "FILE_NOT_FOUND", str(e))
+        await send_failed(callback_url, job_id, attempt_count, "FILE_NOT_FOUND", str(e), stage="parsing")
 
     except ValueError as e:
         logger.error("[INGEST] File không hợp lệ: %s", str(e))
-        await send_failed(callback_url, job_id, "INVALID_FORMAT", str(e))
+        await send_failed(callback_url, job_id, attempt_count, "INVALID_FORMAT", str(e), stage="parsing")
 
     except Exception as e:
         logger.exception("[INGEST] Lỗi không xác định")
-        await send_failed(callback_url, job_id, "INTERNAL_ERROR", str(e))
+        await send_failed(callback_url, job_id, attempt_count, "INTERNAL_ERROR", str(e))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -211,10 +220,14 @@ def _build_llama_documents(
         metadata = {
             "doc_id": doc_id,
             "subject_id": subject_id,
-            "page_number": page.get("page_number", 0),
-            "chapter": page.get("chapter", ""),
-            "section": page.get("section", ""),
         }
+        
+        if "page_number" in page:
+            metadata["page_number"] = page["page_number"]
+        if "chapter" in page and page["chapter"]:
+            metadata["chapter"] = page["chapter"]
+        if "section" in page and page["section"]:
+            metadata["section"] = page["section"]
 
         doc = LlamaDocument(
             text=page["text"],

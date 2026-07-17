@@ -1,0 +1,50 @@
+{
+  "query_request": {
+    "request_id": "33333333-3333-4333-8333-333333333333",
+    "user_id": "9",
+    "conversation_id": "501",
+    "question": "What does the document say?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Earlier question"
+      },
+      {
+        "role": "assistant",
+        "content": "Earlier answer"
+      }
+    ]
+  },
+  "answer_response": {
+    "answer": "The document contains the requested information.",
+    "no_answer": false,
+    "confidence": "high",
+    "citations": [
+      {
+        "vector_node_id": "11111111-1111-4111-8111-111111111111",
+        "doc_id": "42",
+        "snippet": "A verified source fragment.",
+        "page_number": 1,
+        "chapter": "Introduction"
+      }
+    ],
+    "usage": {
+      "model": "models/gemini-2.0-flash",
+      "prompt_tokens": 21,
+      "completion_tokens": 8,
+      "total_tokens": 29
+    }
+  },
+  "no_answer_response": {
+    "answer": "Không đủ dữ liệu để trả lời từ tài liệu hiện có.",
+    "no_answer": true,
+    "confidence": "low",
+    "citations": [],
+    "usage": null
+  },
+  "error_response": {
+    "error_code": "RAG_QUERY_FAILED",
+    "message": "The query could not be processed.",
+    "timestamp": "2026-07-17T00:00:00Z"
+  }
+}

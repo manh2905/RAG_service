@@ -65,6 +65,7 @@ class IngestRequest(BaseModel):
     """
     doc_id: str = Field(..., description="ID duy nhất của tài liệu")
     job_id: str = Field(..., description="ID job do Node.js tạo trước")
+    attempt_count: int = Field(..., description="Processing attempt hiện tại, số nguyên từ 1")
     subject_id: str = Field(..., description="ID môn học mà tài liệu thuộc về")
     file_path: str = Field(..., description="Đường dẫn tuyệt đối tới file trên server")
     callback_url: str = Field(..., description="URL để Python callback kết quả về Node.js")
@@ -90,12 +91,15 @@ class IngestAcceptedResponse(BaseModel):
 
 class ChunkManifestItem(BaseModel):
     """Thông tin tóm tắt của một chunk trong manifest."""
-    chunk_id: str = Field(..., description="UUID của chunk/point trong Qdrant")
     chunk_index: int = Field(..., description="Thứ tự chunk (0-indexed)")
-    page_number: int = Field(default=0, description="Số trang nguồn")
-    chapter: str = Field(default="", description="Tên chương")
-    section: str = Field(default="", description="Tên mục/phần")
-    text_preview: str = Field(default="", description="50 ký tự đầu tiên của chunk")
+    chunk_id: str = Field(..., description="UUID thực dùng làm Qdrant point ID")
+    chunk_text: str = Field(..., description="Toàn bộ text đã được embedding/index")
+    content_hash: str = Field(..., description="SHA-256 lowercase hex của exact UTF-8 chunk_text")
+    token_count: Optional[int] = Field(default=None, description="Số lượng token (ước tính)")
+    page_number: Optional[int] = Field(default=None, description="Số trang nguồn (1-based)")
+    chapter: Optional[str] = Field(default=None, description="Tên chương")
+    section: Optional[str] = Field(default=None, description="Tên mục/phần")
+    text_preview: Optional[str] = Field(default=None, description="50 ký tự đầu tiên của chunk")
 
 
 class CallbackPayload(BaseModel):
@@ -110,7 +114,7 @@ class CallbackPayload(BaseModel):
     - CANCELLED: Đã bị hủy
     """
     job_id: str = Field(..., description="Job ID matching với request ban đầu")
-    attempt_count: int = Field(default=1, description="Số lần gửi callback (retry count)")
+    attempt_count: int = Field(..., description="Processing-job attempt, giữ nguyên từ request")
     event_type: Literal["PROGRESS", "SUCCEEDED", "FAILED", "CANCELLED"] = Field(
         ..., description="Loại sự kiện"
     )
@@ -150,6 +154,7 @@ class VisibilityRequest(BaseModel):
     Ẩn hoặc hiện tài liệu trong RAG (bật/tắt truy xuất).
     """
     job_id: str = Field(..., description="ID job do Node.js tạo")
+    attempt_count: int = Field(..., description="Processing attempt hiện tại")
     action: Literal["hide", "unhide"] = Field(
         ..., description="'hide' = ẩn khỏi RAG, 'unhide' = hiện lại"
     )
@@ -162,6 +167,7 @@ class DeleteRequest(BaseModel):
     Xóa toàn bộ vectors của tài liệu khỏi Qdrant.
     """
     job_id: str = Field(..., description="ID job do Node.js tạo")
+    attempt_count: int = Field(..., description="Processing attempt hiện tại")
     callback_url: str = Field(..., description="URL callback kết quả")
 
 
@@ -190,11 +196,13 @@ class QueryRequest(BaseModel):
     Search trên toàn bộ tài liệu READY + VISIBLE (is_hidden != true).
     """
     question: str = Field(..., description="Câu hỏi của người dùng")
-    conversation_id: str = Field(..., description="ID cuộc hội thoại hiện tại")
+    conversation_id: str = Field(..., description="ID cuộc hội thoại hiện tại do NodeJS tạo")
     history: Optional[List[ChatMessage]] = Field(
         default=[],
         description="Lịch sử hội thoại gần nhất (Node.js gửi kèm)"
     )
+    request_id: Optional[str] = Field(default=None, description="Correlation/idempotency extension")
+    user_id: Optional[str] = Field(default=None, description="Correlation context")
 
 
 class Citation(BaseModel):
@@ -203,9 +211,10 @@ class Citation(BaseModel):
     Bao gồm thông tin heading hierarchy (chapter, section) để
     người dùng dễ dàng tra cứu lại vị trí trong tài liệu.
     """
+    vector_node_id: str = Field(..., description="Qdrant point ID của retrieved chunk")
     doc_id: str = Field(..., description="ID của tài liệu được trích dẫn")
-    page_number: int = Field(..., description="Số trang chứa thông tin")
     snippet: str = Field(..., description="Đoạn trích ngắn từ tài liệu gốc")
+    page_number: Optional[int] = Field(default=None, description="Số trang chứa thông tin")
     chapter: Optional[str] = Field(
         default=None,
         description="Tên chương (H1) chứa đoạn trích dẫn"

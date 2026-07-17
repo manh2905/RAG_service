@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 async def hide_document_background(
     doc_id: str,
     job_id: str,
+    attempt_count: int,
     callback_url: str,
 ) -> None:
     """
@@ -38,7 +39,7 @@ async def hide_document_background(
     Khi search, filter is_hidden != true sẽ bỏ qua các chunks này.
     """
     try:
-        await send_progress(callback_url, job_id, "hiding")
+        await send_progress(callback_url, job_id, attempt_count, "hiding")
 
         settings = get_settings()
         client = await get_qdrant_client()
@@ -62,23 +63,24 @@ async def hide_document_background(
 
         logger.info("[DOC_MANAGER] Đã ẩn doc_id=%s (%d chunks)", doc_id, count)
 
-        await send_succeeded_visibility(callback_url, job_id, updated_count=count)
+        await send_succeeded_visibility(callback_url, job_id, attempt_count, updated_count=count)
 
     except Exception as e:
         logger.exception("[DOC_MANAGER] Lỗi khi ẩn doc_id=%s", doc_id)
-        await send_failed(callback_url, job_id, "HIDE_ERROR", str(e))
+        await send_failed(callback_url, job_id, attempt_count, "HIDE_ERROR", str(e))
 
 
 async def unhide_document_background(
     doc_id: str,
     job_id: str,
+    attempt_count: int,
     callback_url: str,
 ) -> None:
     """
     Hiện lại tài liệu trong RAG: set is_hidden=false.
     """
     try:
-        await send_progress(callback_url, job_id, "unhiding")
+        await send_progress(callback_url, job_id, attempt_count, "unhiding")
 
         settings = get_settings()
         client = await get_qdrant_client()
@@ -100,16 +102,17 @@ async def unhide_document_background(
 
         logger.info("[DOC_MANAGER] Đã hiện lại doc_id=%s (%d chunks)", doc_id, count)
 
-        await send_succeeded_visibility(callback_url, job_id, updated_count=count)
+        await send_succeeded_visibility(callback_url, job_id, attempt_count, updated_count=count)
 
     except Exception as e:
         logger.exception("[DOC_MANAGER] Lỗi khi hiện lại doc_id=%s", doc_id)
-        await send_failed(callback_url, job_id, "UNHIDE_ERROR", str(e))
+        await send_failed(callback_url, job_id, attempt_count, "UNHIDE_ERROR", str(e))
 
 
 async def delete_document_background(
     doc_id: str,
     job_id: str,
+    attempt_count: int,
     callback_url: str,
 ) -> None:
     """
@@ -117,7 +120,7 @@ async def delete_document_background(
     Theo sơ đồ: xóa vẫn giữ file gốc và lịch sử MySQL (Node.js xử lý).
     """
     try:
-        await send_progress(callback_url, job_id, "deleting")
+        await send_progress(callback_url, job_id, attempt_count, "deleting")
 
         settings = get_settings()
         client = await get_qdrant_client()
@@ -142,11 +145,11 @@ async def delete_document_background(
 
         logger.info("[DOC_MANAGER] Đã xóa doc_id=%s (%d vectors)", doc_id, count)
 
-        await send_succeeded_delete(callback_url, job_id, deleted_count=count)
+        await send_succeeded_delete(callback_url, job_id, attempt_count, deleted_count=count)
 
     except Exception as e:
         logger.exception("[DOC_MANAGER] Lỗi khi xóa doc_id=%s", doc_id)
-        await send_failed(callback_url, job_id, "DELETE_ERROR", str(e))
+        await send_failed(callback_url, job_id, attempt_count, "DELETE_ERROR", str(e))
 
 
 def _count_points_by_doc_id(client, collection_name: str, doc_id: str) -> int:

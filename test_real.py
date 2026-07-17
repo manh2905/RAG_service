@@ -12,6 +12,7 @@ async def main():
     req = IngestRequest(
         doc_id="doc_real_test",
         job_id="job_real_1",
+        attempt_count=1,
         subject_id="sub_test",
         file_path=pdf_path,
         callback_url="http://localhost:3000/callback" 

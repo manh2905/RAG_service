@@ -12,7 +12,9 @@ async def test_search(desc=""):
     req = QueryRequest(
         question="Tài liệu này nói về chủ đề gì?",
         conversation_id="conv_1",
-        history=[]
+        history=[],
+        request_id="req_test_1",
+        user_id="user_test_1"
     )
     try:
         response = await process_query(req)
@@ -36,7 +38,7 @@ async def main():
     print("\n==============================================")
     print("🔒 BƯỚC 2: ẨN TÀI LIỆU (doc_real_test)")
     from services.doc_manager import unhide_document_background
-    await hide_document_background("doc_real_test", "job_hide", "http://localhost/cb")
+    await hide_document_background("doc_real_test", "job_hide", 1, "http://localhost/cb")
     print("✅ Đã ẩn tài liệu thành công!")
     
     # 3. Test Search (Sau khi ẩn)
@@ -45,13 +47,13 @@ async def main():
     # 4. Test Unhide (Hiện lại tài liệu)
     print("\n==============================================")
     print("🔓 BƯỚC 4: HIỆN LẠI TÀI LIỆU (doc_real_test)")
-    await unhide_document_background("doc_real_test", "job_unhide", "http://localhost/cb")
+    await unhide_document_background("doc_real_test", "job_unhide", 1, "http://localhost/cb")
     print("✅ Đã hiện lại tài liệu thành công!")
     
     # 5. Test Delete (Xóa tài liệu)
     print("\n==============================================")
     print("🗑️ BƯỚC 5: XÓA VĨNH VIỄN TÀI LIỆU (doc_real_test)")
-    await delete_document_background("doc_real_test", "job_delete", "http://localhost/cb")
+    await delete_document_background("doc_real_test", "job_delete", 1, "http://localhost/cb")
     print("✅ Đã xóa tài liệu khỏi Qdrant!")
     
     # 6. Test Search (Sau khi xóa)

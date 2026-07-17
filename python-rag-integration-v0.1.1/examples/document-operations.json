@@ -1,0 +1,39 @@
+{
+  "hide_request": {
+    "job_id": "102",
+    "attempt_count": 1,
+    "action": "hide",
+    "callback_url": "http://node:5000/api/internal/rag/processing-callback"
+  },
+  "unhide_request": {
+    "job_id": "103",
+    "attempt_count": 1,
+    "action": "unhide",
+    "callback_url": "http://node:5000/api/internal/rag/processing-callback"
+  },
+  "visibility_accepted_response": {
+    "status": "accepted",
+    "job_id": "102"
+  },
+  "visibility_success_callback": {
+    "job_id": "102",
+    "attempt_count": 1,
+    "event_type": "SUCCEEDED",
+    "updated_count": 8
+  },
+  "delete_request": {
+    "job_id": "104",
+    "attempt_count": 1,
+    "callback_url": "http://node:5000/api/internal/rag/processing-callback"
+  },
+  "delete_accepted_response": {
+    "status": "accepted",
+    "job_id": "104"
+  },
+  "delete_success_callback": {
+    "job_id": "104",
+    "attempt_count": 1,
+    "event_type": "SUCCEEDED",
+    "deleted_count": 8
+  }
+}

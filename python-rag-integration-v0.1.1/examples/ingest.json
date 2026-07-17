@@ -1,0 +1,49 @@
+{
+  "ingest_request": {
+    "doc_id": "42",
+    "job_id": "101",
+    "attempt_count": 2,
+    "subject_id": "mvp-global",
+    "file_path": "/shared/uploads/documents/example.pdf",
+    "callback_url": "http://node:5000/api/internal/rag/processing-callback",
+    "teacher_metadata": {}
+  },
+  "accepted_response": {
+    "status": "accepted",
+    "job_id": "101",
+    "message": "Document processing accepted"
+  },
+  "progress_callback": {
+    "job_id": "101",
+    "attempt_count": 2,
+    "event_type": "PROGRESS",
+    "stage": "embedding"
+  },
+  "success_callback": {
+    "job_id": "101",
+    "attempt_count": 2,
+    "event_type": "SUCCEEDED",
+    "chunks_count": 1,
+    "chunk_manifest": [
+      {
+        "chunk_index": 0,
+        "chunk_id": "11111111-1111-4111-8111-111111111111",
+        "chunk_text": "Chunk one full text.",
+        "content_hash": "3f475660ca980c930b5ea52e46d9e3628b99e01a01218ac5010c8dbdd9c63ef2",
+        "token_count": 5,
+        "page_number": 1,
+        "chapter": "Introduction"
+      }
+    ]
+  },
+  "failure_callback": {
+    "job_id": "101",
+    "attempt_count": 2,
+    "event_type": "FAILED",
+    "stage": "parsing",
+    "error": {
+      "code": "DOCUMENT_PARSE_FAILED",
+      "message": "The document could not be parsed."
+    }
+  }
+}

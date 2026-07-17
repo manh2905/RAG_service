@@ -355,8 +355,9 @@ def _extract_citations(
 
         citations.append(
             Citation(
+                vector_node_id=str(result.id),
                 doc_id=payload.get("doc_id", "unknown"),
-                page_number=payload.get("page_number", 0),
+                page_number=payload.get("page_number"),
                 snippet=payload.get("text", "")[:200],
                 chapter=payload.get("chapter"),
                 section=payload.get("section"),
