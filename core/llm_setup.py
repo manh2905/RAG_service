@@ -11,21 +11,22 @@ Phiên bản v2:
 import logging
 from functools import lru_cache
 
-from llama_index.llms.gemini import Gemini
-from llama_index.embeddings.gemini import GeminiEmbedding
+# pyrefly: ignore [missing-import]
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 @lru_cache()
-def get_embedding_model() -> GeminiEmbedding:
+def get_embedding_model() -> GoogleGenAIEmbedding:
     """
     Khởi tạo và cache Gemini Embedding model.
     Model này biến văn bản thành vector số để lưu/truy vấn trong Qdrant.
 
     Returns:
-        GeminiEmbedding: Instance embedding model đã sẵn sàng sử dụng.
+        GoogleGenAIEmbedding: Instance embedding model đã sẵn sàng sử dụng.
     """
     settings = get_settings()
 
@@ -34,7 +35,7 @@ def get_embedding_model() -> GeminiEmbedding:
         settings.GEMINI_EMBEDDING_MODEL,
     )
 
-    embed_model = GeminiEmbedding(
+    embed_model = GoogleGenAIEmbedding(
         model_name=settings.GEMINI_EMBEDDING_MODEL,
         api_key=settings.GOOGLE_API_KEY,
     )
@@ -44,13 +45,13 @@ def get_embedding_model() -> GeminiEmbedding:
 
 
 @lru_cache()
-def get_llm() -> Gemini:
+def get_llm() -> GoogleGenAI:
     """
     Khởi tạo và cache Gemini LLM dùng cho việc sinh câu trả lời RAG.
     Cấu hình temperature thấp để đảm bảo câu trả lời bám sát context.
 
     Returns:
-        Gemini: Instance LLM đã sẵn sàng sử dụng.
+        GoogleGenAI: Instance LLM đã sẵn sàng sử dụng.
     """
     settings = get_settings()
 
@@ -59,7 +60,7 @@ def get_llm() -> Gemini:
         settings.GEMINI_LLM_MODEL,
     )
 
-    llm = Gemini(
+    llm = GoogleGenAI(
         model=settings.GEMINI_LLM_MODEL,
         api_key=settings.GOOGLE_API_KEY,
         temperature=0.1,  # Giữ thấp để trả lời chính xác, ít sáng tạo
@@ -70,7 +71,7 @@ def get_llm() -> Gemini:
 
 
 @lru_cache()
-def get_router_llm() -> Gemini:
+def get_router_llm() -> GoogleGenAI:
     """
     Khởi tạo và cache Gemini LLM riêng cho Query Router.
     Temperature=0 để phân loại intent một cách deterministic.
@@ -78,7 +79,7 @@ def get_router_llm() -> Gemini:
     KHÔNG dùng để sinh câu trả lời.
 
     Returns:
-        Gemini: Instance LLM cho router với temperature=0.
+        GoogleGenAI: Instance LLM cho router với temperature=0.
     """
     settings = get_settings()
 
@@ -87,7 +88,7 @@ def get_router_llm() -> Gemini:
         settings.GEMINI_LLM_MODEL,
     )
 
-    router_llm = Gemini(
+    router_llm = GoogleGenAI(
         model=settings.GEMINI_LLM_MODEL,
         api_key=settings.GOOGLE_API_KEY,
         temperature=0.0,  # Deterministic — luôn cho kết quả nhất quán

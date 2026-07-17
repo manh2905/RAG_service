@@ -13,7 +13,7 @@ Phiên bản v3:
 from functools import lru_cache
 # pyrefly: ignore [missing-import]
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
+import os
 
 class Settings(BaseSettings):
     """
@@ -28,14 +28,14 @@ class Settings(BaseSettings):
     )
 
     # === Google Gemini API ===
-    GOOGLE_API_KEY: str = ""
+    GOOGLE_API_KEY: str
 
     # === LlamaParse (LlamaIndex Cloud) ===
-    LLAMA_CLOUD_API_KEY: str = ""
+    LLAMA_CLOUD_API_KEY: str
 
     # === Tên model Gemini ===
-    GEMINI_LLM_MODEL: str = "models/gemini-2.0-flash"
-    GEMINI_EMBEDDING_MODEL: str = "models/text-embedding-004"
+    GEMINI_LLM_MODEL: str = "models/gemini-3.5-flash"
+    GEMINI_EMBEDDING_MODEL: str = "models/gemini-embedding-001"
 
     # === Qdrant Vector Database ===
     QDRANT_URL: str = "http://localhost:6333"
@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     # === CORS — cho phép Node.js backend gọi tới ===
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 
-    # === Embedding Dimension (text-embedding-004 trả về 768 chiều) ===
+    # === Embedding Dimension (gemini-embedding-001 trả về 768 chiều) ===
     EMBEDDING_DIMENSION: int = 768
 
     # === Callback — gọi ngược Node.js sau khi xử lý xong ===

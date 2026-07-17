@@ -42,7 +42,7 @@ def test_ingest_accepted(mock_bg_task):
         "doc_id": "doc1",
         "job_id": "job1",
         "subject_id": "sub1",
-        "file_path": "/test/file.pdf",
+        "file_path": "/tests/file.pdf",
         "callback_url": "http://test/cb"
     }
     response = client.post("/api/ingest", json=payload)
