@@ -18,6 +18,7 @@ def test_ingest_request_valid():
     data = {
         "doc_id": "123",
         "job_id": "job1",
+        "attempt_count": 1,
         "subject_id": "sub1",
         "file_path": "/tmp/file.pdf",
         "callback_url": "http://localhost/cb",
@@ -41,6 +42,7 @@ def test_query_request_valid():
 def test_visibility_request_invalid_action():
     data = {
         "job_id": "job1",
+        "attempt_count": 1,
         "action": "delete", # Invalid action
         "callback_url": "http://localhost/cb",
     }
@@ -50,6 +52,7 @@ def test_visibility_request_invalid_action():
 def test_callback_payload_valid():
     data = {
         "job_id": "job1",
+        "attempt_count": 1,
         "event_type": "PROGRESS",
         "stage": "parsing"
     }

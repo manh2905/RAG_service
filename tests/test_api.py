@@ -24,8 +24,10 @@ sys.modules['llama_index.core.node_parser'] = MagicMock()
 sys.modules['llama_index.core.schema'] = MagicMock()
 sys.modules['llama_index.llms'] = MagicMock()
 sys.modules['llama_index.llms.gemini'] = MagicMock()
+sys.modules['llama_index.llms.google_genai'] = MagicMock()
 sys.modules['llama_index.embeddings'] = MagicMock()
 sys.modules['llama_index.embeddings.gemini'] = MagicMock()
+sys.modules['llama_index.embeddings.google_genai'] = MagicMock()
 
 from main import app
 
@@ -41,6 +43,7 @@ def test_ingest_accepted(mock_bg_task):
     payload = {
         "doc_id": "doc1",
         "job_id": "job1",
+        "attempt_count": 1,
         "subject_id": "sub1",
         "file_path": "/tests/file.pdf",
         "callback_url": "http://test/cb"
@@ -56,6 +59,7 @@ def test_ingest_accepted(mock_bg_task):
 def test_hide_document_accepted(mock_bg_task):
     payload = {
         "job_id": "job2",
+        "attempt_count": 1,
         "action": "hide",
         "callback_url": "http://test/cb"
     }
@@ -68,6 +72,7 @@ def test_hide_document_accepted(mock_bg_task):
 def test_delete_document_accepted(mock_bg_task):
     payload = {
         "job_id": "job3",
+        "attempt_count": 1,
         "callback_url": "http://test/cb"
     }
     # Using json via request body is correct for DELETE here (httpx supports it)
@@ -105,3 +110,68 @@ def test_query_endpoint(mock_process_query):
         
     assert response.status_code == 200
     assert response.json()["answer"] == "Mocked answer"
+
+
+def test_citations_are_renumbered_to_match_returned_order():
+    from services.rag_engine import _extract_citations
+
+    result_1 = MagicMock(
+        id="point-1",
+        payload={
+            "doc_id": "doc-1",
+            "page_number": 7,
+            "text": "Page citation trong API công khai bắt đầu từ 1.",
+        },
+    )
+    result_2 = MagicMock(
+        id="point-2",
+        payload={"doc_id": "doc-1", "page_number": 9, "text": "Không được dùng."},
+    )
+    result_3 = MagicMock(
+        id="point-3",
+        payload={
+            "doc_id": "doc-1",
+            "page_number": 14,
+            "text": "Bảng đáp án xác nhận page là 1-based.",
+        },
+    )
+
+    extracted = _extract_citations(
+        answer="Trang đầu tiên là trang 1 [1], không phải trang 0 [3].",
+        results=[result_1, result_2, result_3],
+        question="Page citation bắt đầu từ mấy?",
+    )
+
+    assert extracted is not None
+    normalized_answer, citations = extracted
+    assert normalized_answer == "Trang đầu tiên là trang 1 [1], không phải trang 0 [2]."
+    assert [citation.vector_node_id for citation in citations] == ["point-1", "point-3"]
+
+
+def test_citation_snippet_selects_relevant_text_inside_chunk():
+    from services.rag_engine import _select_relevant_snippet
+
+    text = (
+        "Metadata của mỗi chunk gồm document_id và chunk_index. " * 8
+        + "\nPage citation trong API công khai bắt đầu từ 1 (1-based). "
+        + "Adapter PDF phải chuyển chỉ số từ 0-based sang 1-based."
+    )
+
+    snippet = _select_relevant_snippet(
+        text=text,
+        question="Page citation bắt đầu từ mấy?",
+        answer="Page citation bắt đầu từ 1.",
+    )
+
+    assert "bắt đầu từ 1" in snippet
+
+
+def test_invalid_citation_marker_is_rejected():
+    from services.rag_engine import _extract_citations
+
+    result = MagicMock(
+        id="point-1",
+        payload={"doc_id": "doc-1", "page_number": 1, "text": "Nội dung nguồn."},
+    )
+
+    assert _extract_citations("Câu trả lời [2].", [result], "Câu hỏi") is None
