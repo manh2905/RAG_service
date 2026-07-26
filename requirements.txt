@@ -12,8 +12,8 @@ qdrant-client==1.14.2
 
 # === LLM / RAG Framework ===
 llama-index>=0.11.0
-llama-index-llms-gemini>=0.3.0
-llama-index-embeddings-gemini>=0.3.0
+llama-index-llms-google-genai==0.9.5
+llama-index-embeddings-google-genai==0.5.1
 
 # === Document Parsing ===
 llama-parse==0.6.4

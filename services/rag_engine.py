@@ -240,8 +240,29 @@ async def process_query(request: QueryRequest) -> QueryResponse:
         logger.error("Lỗi khi gọi Gemini LLM: %s", str(e))
         raise
 
-    # ── Bước 7: Trích xuất citations ─────────────────────────────
-    citations = _extract_citations(answer_text, filtered_results)
+    # ── Bước 7: Trích xuất và chuẩn hóa citations ─────────────────
+    citation_result = _extract_citations(
+        answer=answer_text,
+        results=filtered_results,
+        question=request.question,
+    )
+
+    # Một câu trả lời RAG không có marker, hoặc có marker không ánh xạ
+    # được về retrieval result, không được phép tạo citation giả.
+    if citation_result is None:
+        logger.warning(
+            "Câu trả lời không ánh xạ an toàn được về retrieval results; "
+            "chuyển sang no_answer"
+        )
+        return QueryResponse(
+            answer="Không đủ dữ liệu để tạo câu trả lời có nguồn trích dẫn đáng tin cậy.",
+            citations=[],
+            confidence="low",
+            no_answer=True,
+            usage=usage,
+        )
+
+    answer_text, citations = citation_result
     confidence = _evaluate_confidence(filtered_results)
 
     return QueryResponse(
@@ -338,33 +359,153 @@ def _build_rag_prompt(
 def _extract_citations(
     answer: str,
     results: list[Any],
-) -> list[Citation]:
-    """Trích xuất danh sách Citation từ câu trả lời của LLM."""
-    cited_indices = set()
-    matches = re.findall(r"\[(\d+)\]", answer)
+    question: str = "",
+) -> tuple[str, list[Citation]] | None:
+    """
+    Ánh xạ marker của LLM về retrieval result và đánh lại marker liên tục.
 
-    for match in matches:
+    Ví dụ LLM dùng result [1] và [3] thì response cuối sẽ dùng [1] và [2],
+    đúng với thứ tự của mảng citations mà Node.js lưu. Nếu có bất kỳ marker
+    nào không hợp lệ, hoặc không có marker, kết quả bị từ chối.
+    """
+    raw_matches = re.findall(r"\[(\d+)\]", answer)
+    if not raw_matches:
+        return None
+
+    referenced_indices: list[int] = []
+    seen: set[int] = set()
+    for match in raw_matches:
         idx = int(match)
-        if 1 <= idx <= len(results):
-            cited_indices.add(idx)
+        if not 1 <= idx <= len(results):
+            return None
+        if idx not in seen:
+            seen.add(idx)
+            referenced_indices.append(idx)
+
+    marker_map = {
+        original_idx: citation_idx
+        for citation_idx, original_idx in enumerate(referenced_indices, start=1)
+    }
+
+    def replace_marker(match: re.Match[str]) -> str:
+        return f"[{marker_map[int(match.group(1))]}]"
+
+    normalized_answer = re.sub(r"\[(\d+)\]", replace_marker, answer)
 
     citations = []
-    for idx in sorted(cited_indices):
+    for idx in referenced_indices:
         result = results[idx - 1]
         payload = result.payload
+        chunk_text = payload.get("text", "")
 
         citations.append(
             Citation(
                 vector_node_id=str(result.id),
                 doc_id=payload.get("doc_id", "unknown"),
                 page_number=payload.get("page_number"),
-                snippet=payload.get("text", "")[:200],
+                snippet=_select_relevant_snippet(
+                    text=chunk_text,
+                    question=question,
+                    answer=answer,
+                ),
                 chapter=payload.get("chapter"),
                 section=payload.get("section"),
             )
         )
 
-    return citations
+    return normalized_answer, citations
+
+
+def _select_relevant_snippet(
+    text: str,
+    question: str,
+    answer: str,
+    max_chars: int = 500,
+) -> str:
+    """
+    Chọn đoạn nguồn gần nhất với câu hỏi/câu trả lời thay vì luôn lấy đầu chunk.
+
+    Đây là trích xuất trực tiếp từ chunk đã retrieval, không sinh lại nội dung.
+    """
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) <= 220:
+        return text
+
+    segments = [
+        segment.strip()
+        for segment in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if segment.strip()
+    ]
+    if not segments:
+        return text[:max_chars].strip()
+
+    stop_words = {
+        "các", "cho", "của", "được", "hay", "khi", "là", "một", "này",
+        "những", "phần", "qua", "sau", "theo", "thì", "trong", "trên",
+        "vào", "và", "với", "tài", "liệu",
+    }
+
+    def keywords(value: str) -> set[str]:
+        return {
+            word
+            for word in re.findall(r"\w+", value.lower(), flags=re.UNICODE)
+            if len(word) > 2 and word not in stop_words and not word.isdigit()
+        }
+
+    question_words = keywords(question)
+    answer_words = keywords(re.sub(r"\[\d+\]", "", answer))
+
+    def score(segment: str) -> tuple[int, int]:
+        segment_words = keywords(segment)
+        relevance = (
+            3 * len(segment_words & question_words)
+            + len(segment_words & answer_words)
+        )
+        return relevance, -len(segment)
+
+    best_idx = max(range(len(segments)), key=lambda idx: score(segments[idx]))
+    selected = segments[best_idx]
+
+    if len(selected) > max_chars:
+        relevant_words = question_words | answer_words
+        match_positions = [
+            match.start()
+            for match in re.finditer(r"\w+", selected.lower(), flags=re.UNICODE)
+            if match.group(0) in relevant_words
+        ]
+        center = match_positions[0] if match_positions else 0
+        start = max(0, center - max_chars // 3)
+        end = min(len(selected), start + max_chars)
+        start = max(0, end - max_chars)
+        selected = selected[start:end].strip()
+
+    # Thêm ngữ cảnh liền kề nhưng luôn giữ đoạn liên quan ở trong giới hạn.
+    left = best_idx - 1
+    right = best_idx + 1
+    while len(selected) < 220 and (left >= 0 or right < len(segments)):
+        candidates = []
+        if left >= 0:
+            candidates.append(("left", segments[left]))
+        if right < len(segments):
+            candidates.append(("right", segments[right]))
+
+        side, candidate = max(candidates, key=lambda item: score(item[1]))
+        combined = (
+            f"{candidate}\n{selected}"
+            if side == "left"
+            else f"{selected}\n{candidate}"
+        )
+        if len(combined) > max_chars:
+            break
+        selected = combined
+        if side == "left":
+            left -= 1
+        else:
+            right += 1
+
+    return selected[:max_chars].strip()
 
 
 def _evaluate_confidence(results: list[Any]) -> str:
